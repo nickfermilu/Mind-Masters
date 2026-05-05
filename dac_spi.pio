@@ -1,0 +1,98 @@
+;
+; dac_spi.pio — PIO SPI driver for DAC8411 (24-bit, CPOL=1)
+;
+; Drives two DAC8411 channels per state machine using shared
+; SCLK and MOSI lines with individual CS (SYNC) pins.
+;
+; Pin mapping:
+;   Side-set : SCLK  (1 pin)
+;   OUT      : MOSI  (1 pin)
+;   SET      : CS0, CS1  (2 consecutive pins, active-low)
+;
+; Protocol:
+;   - 24-bit frame, MSB first
+;   - SCLK idles HIGH (CPOL=1)
+;   - Data latched on FALLING edge of SCLK
+;   - CS (SYNC) active-low; rising edge loads DAC register
+;
+; Frame format (push value << 14 as 32-bit word):
+;   [PD1=0][PD0=0][D15..D0][X5..X0]  (bits 31..8 of pushed word)
+;
+; Usage:
+;   Push 2 words per cycle — channel 0 first, then channel 1.
+;   SM blocks on pull until data is available.
+;
+
+.program dac_spi
+.side_set 1
+
+; One-time init: idle state — SCLK high, both CS inactive (high)
+    set pins, 3      side 1
+
+; ---- Channel 0 (CS0) ----
+.wrap_target
+    pull block        side 1       ; Stall until ch0 data available
+    set pins, 0b10    side 1       ; Assert CS0 (low), CS1 stays high
+    set x, 23         side 1       ; 24 bits to clock out
+ch0_loop:
+    out pins, 1       side 1       ; Set MOSI bit while SCLK high
+    nop               side 0       ; SCLK falling edge — DAC latches bit
+    jmp x-- ch0_loop  side 1       ; SCLK rising edge; loop or fall through
+    set pins, 0b11    side 1       ; Deassert CS0 — rising edge loads DAC
+
+; ---- Channel 1 (CS1) ----
+    pull block        side 1       ; Stall until ch1 data available
+    set pins, 0b01    side 1       ; Assert CS1 (low), CS0 stays high
+    set x, 23         side 1       ; 24 bits
+ch1_loop:
+    out pins, 1       side 1
+    nop               side 0
+    jmp x-- ch1_loop  side 1
+    set pins, 0b11    side 1       ; Deassert CS1
+.wrap                              ; Back to wrap_target (ch0 pull)
+
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void dac_spi_program_init(PIO pio, uint sm, uint offset,
+                                        uint sclk_pin, uint mosi_pin,
+                                        uint cs_base_pin) {
+    // Claim GPIO pins for PIO
+    pio_gpio_init(pio, sclk_pin);
+    pio_gpio_init(pio, mosi_pin);
+    pio_gpio_init(pio, cs_base_pin);
+    pio_gpio_init(pio, cs_base_pin + 1);
+
+    // All outputs
+    pio_sm_set_consecutive_pindirs(pio, sm, sclk_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, mosi_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, cs_base_pin, 2, true);
+
+    // Build SM config
+    pio_sm_config c = dac_spi_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, sclk_pin);        // side-set = SCLK
+    sm_config_set_out_pins(&c, mosi_pin, 1);          // OUT = MOSI
+    sm_config_set_set_pins(&c, cs_base_pin, 2);       // SET = CS0, CS1
+
+    // MSB first (shift left), manual pull, 32-bit threshold
+    sm_config_set_out_shift(&c, false, false, 32);
+
+    // PIO clock = sys_clk / 4  →  ~37.5 MHz at 150 MHz
+    // Effective SPI clock ≈ 12.5 MHz (3 PIO cycles per bit)
+    // DAC8411 supports up to 50 MHz, so plenty of margin
+    sm_config_set_clkdiv(&c, 4.0f);
+
+    // Init SM (disabled, PC = offset)
+    pio_sm_init(pio, sm, offset, &c);
+
+    // Set idle pin states: SCLK=1, MOSI=0, CS0=1, CS1=1
+    pio_sm_set_pins_with_mask(pio, sm,
+        (1u << sclk_pin) | (1u << cs_base_pin) | (1u << (cs_base_pin + 1)),
+        (1u << sclk_pin) | (1u << mosi_pin) |
+        (1u << cs_base_pin) | (1u << (cs_base_pin + 1)));
+
+    // Start
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
